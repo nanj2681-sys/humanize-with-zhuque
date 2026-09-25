@@ -1,0 +1,4 @@
+interface:
+  display_name: "朱雀文章去 AI 味"
+  short_description: "按事实守恒规则改写中文文章并循环通过朱雀检测门槛与审计"
+  default_prompt: "使用 $humanize-with-zhuque 根据材料生成或改写中文文章，在事实守恒和安全边界内迭代朱雀检测，达到全部门槛后再定稿。"
