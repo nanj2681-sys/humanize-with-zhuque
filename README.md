@@ -10,7 +10,7 @@
 
 - 根据材料生成或改写中文文章，尤其适合政府报告、公文、调研报告、讲话稿和工作总结。
 - 在送检前建立事实台账，保护日期、数字、金额、政策名称、条件、责任边界和语义强度。
-- 使用腾讯朱雀网页或官方 API 检测完整正文。
+- 默认使用腾讯朱雀官网的免费网页通道检测完整正文；官方 API 仅在用户明确选择时启用。
 - 只重写疑似 AI 或确定 AI 的片段，并在每轮修改后重新检查事实。
 - 只有全部门禁通过后才允许标记为最终稿。
 
@@ -65,7 +65,7 @@ $humanize-with-zhuque 请根据这些材料写一篇调研报告，按朱雀流�
   -> 文档格式检查与定稿
 ```
 
-默认每个批准批次最多提交六次，最后一次保留给最终完整正文。遇到验证码、登录、配额、缺少凭据或请求结果不明时停止，不绕过平台限制，也不盲目重试。
+默认每个批准批次最多提交六次，最后一次保留给最终完整正文。遇到验证码、登录、网页配额耗尽或请求结果不明时停止，不绕过平台限制，也不盲目重试。缺少 API 凭据只阻断 API 通道，不影响继续使用官网网页；用户明确要求 API-only 时除外。
 
 ## 辅助脚本
 
@@ -93,16 +93,29 @@ python3 humanize-with-zhuque/scripts/fact_guard.py check \
   --output run-artifacts/fact-check-01.json
 ```
 
-离线评估已绑定正文的朱雀响应：
+默认网页通道先生成不联网的浏览器交接状态：
+
+```bash
+python3 humanize-with-zhuque/scripts/zhuque_gate.py \
+  --input run-artifacts/candidate-01.txt \
+  --output run-artifacts/detection-current.json
+```
+
+它应返回 `PENDING / WEBPAGE_RESULT_REQUIRED` 和官网地址，不会调用网络，也不需要 API Key。随后使用可见浏览器打开[腾讯朱雀 AI 检测助手](https://matrix.tencent.com/ai-detect/ai_gen)，读取页面当前免费次数，提交完整正文并保留截图或浏览器记录。
+
+将网页可见结果规范化后，离线评估并更新当前状态：
 
 ```bash
 python3 humanize-with-zhuque/scripts/zhuque_gate.py \
   --response run-artifacts/visible-zhuque-result.json \
+  --web-response \
   --input run-artifacts/candidate-01.txt \
-  --output run-artifacts/detection-01.json
+  --output run-artifacts/detection-current.json
 ```
 
-官方 API 模式必须显式加入 `--live-api`，并从环境变量读取配置：
+`--web-response` 将结果适配器标记为 `official_webpage`，但脚本本身不能证明来源，仍须保留当前网页截图或浏览器记录。
+
+官方 API 是显式可选通道。只有用户明确选择并授权额度及潜在费用时，才加入 `--live-api` 并从环境变量读取配置：
 
 ```bash
 export ZHUQUE_GATEWAY="https://ai-gateway.edgeone.link"
@@ -111,10 +124,12 @@ export ZHUQUE_API_KEY="<YOUR_API_KEY>"
 python3 humanize-with-zhuque/scripts/zhuque_gate.py \
   --live-api \
   --input run-artifacts/candidate-01.txt \
-  --output run-artifacts/detection-01.json
+  --output run-artifacts/detection-api-attempt-01.json
 ```
 
-API 调用可能消耗免费额度或产生费用。不要把密钥写入仓库、命令行参数、日志或检测报告。
+即使环境中已有密钥，默认调用仍然走官网网页。API 缺凭据时，脚本会把阻塞范围标记为 `official_api` 并给出官网网页通道，不能据此声称“朱雀不可用”。每次 API 调用必须使用新的不可变输出文件；已有 `SUBMISSION_INTENT`、`RESULT_UNKNOWN` 或标记为可能消耗额度的事件不会被覆盖，也不会再次发起请求。若请求返回后主输出文件仍被其他进程锁定，脚本会在同目录写入唯一的 `*.recovery-*.json` 保存完整结果，并要求人工核对后再重试。API 调用可能消耗免费额度或产生费用；不要把密钥写入仓库、命令行参数、日志或检测报告。
+
+`detection-current.json` 表示当前正文的最新朱雀子门禁。网页得到与当前正文 SHA-256 和完整分段覆盖绑定的有效结果后，可以替代早期 API 适配器阻断成为当前状态；历史证据仍保留，`RESULT_UNKNOWN` 以及隐私、事实、文种和格式阻塞不得被覆盖。
 
 ## 测试
 
@@ -124,7 +139,7 @@ python3 -m unittest discover \
   -v
 ```
 
-当前测试覆盖阈值边界、精确小数、响应与正文绑定、旧结果复用、复合中文数量、日期金额保护、异常输入和失败关闭行为。
+当前 46 项测试覆盖官网网页默认选择、API 显式启用及回退状态、受保护 API 事件不可覆盖、并发写入、恢复记录与失败脱敏、阈值边界、精确小数、响应与正文绑定、旧结果复用、复合中文数量、日期金额保护、异常输入和失败关闭行为。
 
 ## 安全与限制
 
@@ -138,7 +153,7 @@ python3 -m unittest discover \
 
 ## 官方资料
 
-以下接口和额度信息于 2026-09-25 核对，之后可能变化，请以官方当期文档为准。
+以下接口和额度信息于 2026-09-26 核对，之后可能变化，请以官方当期文档为准。
 
 - [腾讯朱雀 AI 检测助手](https://matrix.tencent.com/ai-detect/ai_gen)
 - [腾讯云 EdgeOne Makers：使用朱雀模型](https://cloud.tencent.com/document/product/1552/137539)

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Call Tencent Zhuque text detection once or evaluate a bound saved response.
+"""Prepare the default Zhuque webpage flow, call its API, or evaluate a response.
 
 Exit codes:
   2  invalid command-line syntax (argparse)
@@ -9,16 +9,20 @@ Exit codes:
   21 result unknown or asynchronous PENDING state
   22 blocked operation or invalid configuration
 
-The API key is read only from ZHUQUE_API_KEY. The gateway is read from
-ZHUQUE_GATEWAY. This script never retries a request that could consume quota or
-incur charges. Saved responses must be bound to --input by both a matching
-input_sha256 and exact full segment coverage. Neither mechanism is sufficient
-by itself.
+With only --input, this script performs no network request and returns a
+WEBPAGE_RESULT_REQUIRED handoff for Tencent's official free webpage. API mode
+is opt-in through --live-api. The API key is read only from ZHUQUE_API_KEY and
+the gateway from ZHUQUE_GATEWAY. This script never retries a request that could
+consume quota or incur charges. Saved responses must be bound to --input by
+both a matching input_sha256 and exact full segment coverage. Neither mechanism
+is sufficient by itself.
 """
 
 from __future__ import annotations
 
 import argparse
+import contextlib
+import fcntl
 import hashlib
 import json
 import math
@@ -27,6 +31,7 @@ import re
 import stat
 import sys
 import tempfile
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -45,6 +50,7 @@ MAX_RESPONSE_BYTES = 10 * 1024 * 1024
 MAX_SEGMENTS = 20_000
 RATIO_SUM_TOLERANCE = Decimal("0.001")
 AGGREGATE_AI_NOISE_MAX = Decimal("0.001")
+OFFICIAL_WEB_URL = "https://matrix.tencent.com/ai-detect/ai_gen"
 
 
 class InvalidData(ValueError):
@@ -71,6 +77,10 @@ class ResultUnknown(RuntimeError):
 
 
 class ConfigurationError(RuntimeError):
+    pass
+
+
+class ProtectedOutput(RuntimeError):
     pass
 
 
@@ -160,6 +170,125 @@ def write_json(path: Path, payload: dict[str, Any]) -> None:
             temporary.unlink(missing_ok=True)
 
 
+def write_recovery_json(output: Path, payload: dict[str, Any]) -> Path:
+    """Persist a unique request outcome when the primary output stays locked."""
+
+    expanded = output.expanduser()
+    expanded.parent.mkdir(parents=True, exist_ok=True)
+    recovery: Path | None = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="w",
+            encoding="utf-8",
+            dir=expanded.parent,
+            prefix=f"{expanded.name}.recovery-",
+            suffix=".json",
+            delete=False,
+        ) as handle:
+            recovery = Path(handle.name)
+            handle.write(
+                json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True) + "\n"
+            )
+            handle.flush()
+            os.fsync(handle.fileno())
+        directory_fd = os.open(
+            expanded.parent, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+        )
+        try:
+            os.fsync(directory_fd)
+        finally:
+            os.close(directory_fd)
+        return recovery
+    except Exception:
+        if recovery is not None:
+            recovery.unlink(missing_ok=True)
+        raise
+
+
+@contextlib.contextmanager
+def output_lock(path: Path, *, wait_seconds: float = 0.0):
+    """Serialize one output path, optionally waiting briefly for a local writer."""
+
+    resolved = path.expanduser().resolve(strict=False)
+    digest = hashlib.sha256(str(resolved).encode("utf-8")).hexdigest()[:24]
+    lock_path = Path(tempfile.gettempdir()) / (
+        f"humanize-with-zhuque-{os.getuid()}-{digest}.lock"
+    )
+    flags = (
+        os.O_RDWR
+        | os.O_CREAT
+        | getattr(os, "O_CLOEXEC", 0)
+        | getattr(os, "O_NOFOLLOW", 0)
+    )
+    descriptor = os.open(lock_path, flags, 0o600)
+    try:
+        deadline = time.monotonic() + max(0.0, wait_seconds)
+        while True:
+            try:
+                fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except BlockingIOError as exc:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise ProtectedOutput(
+                        "another process is updating this output path"
+                    ) from exc
+                time.sleep(min(0.05, remaining))
+        try:
+            yield
+        finally:
+            fcntl.flock(descriptor, fcntl.LOCK_UN)
+    finally:
+        os.close(descriptor)
+
+
+def reserve_submission_intent(path: Path, payload: dict[str, Any]) -> None:
+    """Atomically reserve a new immutable API-attempt path before transmission."""
+
+    expanded = path.expanduser()
+    expanded.parent.mkdir(parents=True, exist_ok=True)
+    raw = (
+        json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True) + "\n"
+    ).encode("utf-8")
+    flags = (
+        os.O_WRONLY
+        | os.O_CREAT
+        | os.O_EXCL
+        | getattr(os, "O_CLOEXEC", 0)
+        | getattr(os, "O_NOFOLLOW", 0)
+    )
+    with output_lock(expanded):
+        descriptor = -1
+        created = False
+        try:
+            try:
+                descriptor = os.open(expanded, flags, 0o600)
+                created = True
+            except FileExistsError as exc:
+                raise ProtectedOutput(
+                    "API output path already exists; preserve it and use a new "
+                    "immutable path for this attempt"
+                ) from exc
+            with os.fdopen(descriptor, "wb") as handle:
+                descriptor = -1
+                handle.write(raw)
+                handle.flush()
+                os.fsync(handle.fileno())
+            directory_fd = os.open(
+                expanded.parent, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+            )
+            try:
+                os.fsync(directory_fd)
+            finally:
+                os.close(directory_fd)
+        except Exception:
+            if descriptor >= 0:
+                os.close(descriptor)
+            if created:
+                expanded.unlink(missing_ok=True)
+            raise
+
+
 def ensure_output_distinct(output: Path | None, inputs: list[Path | None]) -> None:
     if output is None:
         return
@@ -182,6 +311,51 @@ def ensure_output_distinct(output: Path | None, inputs: list[Path | None]) -> No
             pass
 
 
+def ensure_output_transition(
+    output: Path,
+    payload: dict[str, Any],
+    *,
+    allow_submission_intent: bool = False,
+) -> None:
+    """Prevent an unresolved API state from being hidden by a later result."""
+
+    expanded = output.expanduser()
+    if not expanded.exists():
+        return
+    raw = read_text(expanded, MAX_RESPONSE_BYTES)
+    existing = loads_strict(raw)
+    if not isinstance(existing, dict):
+        raise ProtectedOutput("existing output is not a JSON object; preserve it")
+
+    existing_verdict = existing.get("verdict")
+    same_input = (
+        isinstance(existing.get("input_sha256"), str)
+        and existing.get("input_sha256") == payload.get("input_sha256")
+    )
+    continuing_live_request = allow_submission_intent and same_input
+
+    if existing_verdict == "SUBMISSION_INTENT" and continuing_live_request:
+        return
+    if existing_verdict == "SUBMISSION_INTENT":
+        raise ProtectedOutput(
+            "existing SUBMISSION_INTENT may represent an in-flight API request; "
+            "verify provider state and use a new output path"
+        )
+    if existing_verdict == "RESULT_UNKNOWN":
+        raise ProtectedOutput(
+            "existing RESULT_UNKNOWN must not be overwritten; verify provider state "
+            "and preserve the original event"
+        )
+    if (
+        existing.get("may_have_been_billed") is True
+        and existing.get("do_not_retry_same_text") is True
+    ):
+        raise ProtectedOutput(
+            "existing API event may have consumed quota and is marked immutable; "
+            "preserve it and use a new output path"
+        )
+
+
 def validate_gateway(raw: str) -> str:
     gateway = raw.rstrip("/")
     parsed = urllib.parse.urlparse(gateway)
@@ -199,10 +373,24 @@ def validate_gateway(raw: str) -> str:
 def resolve_api_config() -> tuple[str, str]:
     raw_gateway = os.environ.get("ZHUQUE_GATEWAY", "").strip()
     api_key = os.environ.get("ZHUQUE_API_KEY", "").strip()
-    if not raw_gateway or not api_key:
+    missing = [
+        name
+        for name, value in (
+            ("ZHUQUE_GATEWAY", raw_gateway),
+            ("ZHUQUE_API_KEY", api_key),
+        )
+        if not value
+    ]
+    if missing:
+        category = {
+            ("ZHUQUE_GATEWAY",): "missing_api_gateway",
+            ("ZHUQUE_API_KEY",): "missing_api_key",
+        }.get(tuple(missing), "missing_api_credentials")
         raise BlockedOperation(
-            "missing_credentials",
-            "set ZHUQUE_GATEWAY and ZHUQUE_API_KEY before API mode",
+            category,
+            "API mode is not configured; missing "
+            + " and ".join(missing)
+            + ". Use the official Zhuque webpage unless API-only was requested.",
         )
     if "\r" in api_key or "\n" in api_key:
         raise ConfigurationError("ZHUQUE_API_KEY must not contain line breaks")
@@ -438,7 +626,7 @@ def evaluate(
     if len(segments) > MAX_SEGMENTS:
         raise InvalidData(f"segment_labels exceeds {MAX_SEGMENTS} entries")
 
-    if source == "saved_response":
+    if source in {"saved_response", "official_webpage"}:
         if input_text is None:
             raise ConfigurationError("--input is required with --response")
         input_binding = verify_saved_response_binding(
@@ -531,6 +719,10 @@ def evaluate(
         "threshold_version": "human>=0.80;suspected<0.20;aggregate-ai<=0.001;no-segment-label-1",
         "checked_at": datetime.now(timezone.utc).isoformat(),
         "source": source,
+        "adapter": {
+            "official_api": "official_api",
+            "official_webpage": "official_webpage",
+        }.get(source, "saved_response_validation"),
         "input_binding": input_binding,
         "verdict": "PASS" if passed else "REVISE",
         "detector_verdict": "PASS" if passed else "REVISE",
@@ -564,6 +756,14 @@ def evaluate(
                 "request_completed": True,
                 "may_have_been_billed": True,
                 "do_not_retry_same_text": True,
+            }
+        )
+    elif source == "official_webpage":
+        result.update(
+            {
+                "source_attestation": "visible_official_webpage",
+                "source_verified_by_script": False,
+                "source_evidence_required": True,
             }
         )
     return result
@@ -600,11 +800,13 @@ def blocked_payload(
     *,
     request_attempted: bool,
 ) -> dict[str, Any]:
-    return {
+    payload = {
         "schema_version": 1,
         "scope": "zhuque_detector_gate",
         "checked_at": datetime.now(timezone.utc).isoformat(),
         "verdict": "BLOCKED",
+        "adapter": "official_api",
+        "blocker_scope": "official_api",
         "passed": False,
         "overall_article_finalizable": False,
         "blocker_category": category,
@@ -614,6 +816,24 @@ def blocked_payload(
         "may_have_been_billed": False,
         "retry_allowed": False,
     }
+    if category in {
+        "missing_api_credentials",
+        "missing_api_gateway",
+        "missing_api_key",
+        "authorization_or_entitlement",
+        "rate_limit_or_quota",
+    }:
+        payload.update(
+            {
+                "fallback_adapter": "official_webpage",
+                "fallback_url": OFFICIAL_WEB_URL,
+                "operator_action": (
+                    "use the official webpage unless the user explicitly requested "
+                    "API-only; do not report Zhuque itself as unavailable"
+                ),
+            }
+        )
+    return payload
 
 
 def result_unknown_payload(
@@ -624,6 +844,8 @@ def result_unknown_payload(
         "scope": "zhuque_detector_gate",
         "checked_at": datetime.now(timezone.utc).isoformat(),
         "verdict": "RESULT_UNKNOWN",
+        "adapter": "official_api",
+        "blocker_scope": "official_api",
         "passed": False,
         "overall_article_finalizable": False,
         "error_category": category,
@@ -643,6 +865,7 @@ def submission_intent_payload(input_text: str) -> dict[str, Any]:
         "scope": "zhuque_detector_gate",
         "checked_at": datetime.now(timezone.utc).isoformat(),
         "verdict": "SUBMISSION_INTENT",
+        "adapter": "official_api",
         "passed": False,
         "overall_article_finalizable": False,
         "input_sha256": sha256_text(input_text),
@@ -653,10 +876,38 @@ def submission_intent_payload(input_text: str) -> dict[str, Any]:
     }
 
 
+def webpage_handoff_payload(input_text: str) -> dict[str, Any]:
+    return {
+        "schema_version": 1,
+        "scope": "zhuque_detector_gate",
+        "checked_at": datetime.now(timezone.utc).isoformat(),
+        "verdict": "PENDING",
+        "status": "WEBPAGE_RESULT_REQUIRED",
+        "adapter": "official_webpage",
+        "passed": False,
+        "overall_article_finalizable": False,
+        "input_sha256": sha256_text(input_text),
+        "webpage_url": OFFICIAL_WEB_URL,
+        "api_credentials_required": False,
+        "request_attempted": False,
+        "may_have_been_billed": False,
+        "submission_allowed": True,
+        "retry_allowed": False,
+        "operator_action": (
+            "open the official webpage in a visible browser, read the displayed "
+            "remaining attempts, submit the exact full text once, preserve visible "
+            "evidence, then evaluate the normalized response with --response "
+            "and --web-response"
+        ),
+    }
+
+
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description=__doc__)
+    parser = argparse.ArgumentParser(description=__doc__, allow_abbrev=False)
     parser.add_argument(
-        "--input", type=Path, help="UTF-8 canonical text; required in API mode"
+        "--input",
+        type=Path,
+        help="UTF-8 canonical text; required for webpage, response, and API modes",
     )
     parser.add_argument(
         "--response",
@@ -664,9 +915,17 @@ def parse_args() -> argparse.Namespace:
         help="evaluate a saved JSON response without network access",
     )
     parser.add_argument(
+        "--web-response",
+        action="store_true",
+        help=(
+            "attest that --response was transcribed from the visible official "
+            "webpage; screenshot or browser evidence is still required"
+        ),
+    )
+    parser.add_argument(
         "--live-api",
         action="store_true",
-        help="authorize one live request that may use quota or incur charges",
+        help="explicitly opt in to one API request that may use quota or incur charges",
     )
     parser.add_argument("--output", type=Path, help="write normalized gate JSON")
     parser.add_argument("--timeout", type=float, default=45.0)
@@ -682,17 +941,31 @@ def emit(payload: dict[str, Any], output: Path | None) -> None:
         print(json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True))
 
 
+def redact_rewrite_target_text(value: Any) -> Any:
+    """Copy a report while removing detector segment text at every nesting level."""
+
+    if isinstance(value, list):
+        return [redact_rewrite_target_text(item) for item in value]
+    if not isinstance(value, dict):
+        return value
+
+    redacted = {
+        key: redact_rewrite_target_text(item) for key, item in value.items()
+    }
+    targets = redacted.get("rewrite_targets")
+    if isinstance(targets, list):
+        for target in targets:
+            if isinstance(target, dict):
+                target.pop("text", None)
+    return redacted
+
+
 def safe_emit(payload: dict[str, Any], output: Path | None) -> bool:
     try:
         emit(payload, output)
         return True
     except (OSError, UnicodeError, TypeError, ValueError) as exc:
-        fallback = json.loads(json.dumps(payload, ensure_ascii=False))
-        targets = fallback.get("rewrite_targets")
-        if isinstance(targets, list):
-            for target in targets:
-                if isinstance(target, dict):
-                    target.pop("text", None)
+        fallback = redact_rewrite_target_text(payload)
         fallback.update(
             {
                 "output_write_failed": True,
@@ -713,13 +986,110 @@ def safe_emit(payload: dict[str, Any], output: Path | None) -> bool:
         return False
 
 
-def finish(payload: dict[str, Any], output: Path | None, exit_code: int) -> int:
-    return exit_code if safe_emit(payload, output) else EXIT_INVALID
+def protected_transition_payload(
+    error: ProtectedOutput,
+    payload: dict[str, Any],
+    output: Path,
+    *,
+    recovery_output: Path | None = None,
+) -> dict[str, Any]:
+    request_completed = payload.get("request_completed") is True
+    may_have_been_billed = payload.get("may_have_been_billed") is True
+    request_attempted = (
+        payload.get("request_attempted") is True
+        or request_completed
+        or may_have_been_billed
+    )
+    do_not_retry = (
+        payload.get("do_not_retry_same_text") is True or may_have_been_billed
+    )
+    result = {
+        "schema_version": 1,
+        "scope": "zhuque_detector_gate",
+        "checked_at": datetime.now(timezone.utc).isoformat(),
+        "verdict": "ERROR",
+        "passed": False,
+        "overall_article_finalizable": False,
+        "error_category": "protected_output_transition",
+        "error": str(error),
+        "preserved_output": str(output),
+        "attempted_verdict": payload.get("verdict"),
+        "input_sha256": payload.get("input_sha256"),
+        "request_attempted": request_attempted,
+        "request_completed": request_completed,
+        "may_have_been_billed": may_have_been_billed,
+        "do_not_retry_same_text": do_not_retry,
+        "operator_action": (
+            "preserve the existing output and any recovery artifact; check provider "
+            "state before retrying"
+            if request_attempted
+            else "preserve the existing output and retry only after its state is clear"
+        ),
+    }
+    if recovery_output is not None:
+        result["recovery_output"] = str(recovery_output)
+    return result
+
+
+def finish(
+    payload: dict[str, Any],
+    output: Path | None,
+    exit_code: int,
+    *,
+    allow_submission_intent: bool = False,
+) -> int:
+    if output is None:
+        return exit_code if safe_emit(payload, None) else EXIT_INVALID
+
+    try:
+        with output_lock(output, wait_seconds=5.0):
+            ensure_output_transition(
+                output,
+                payload,
+                allow_submission_intent=allow_submission_intent,
+            )
+            return exit_code if safe_emit(payload, output) else EXIT_INVALID
+    except (OSError, UnicodeError, InvalidData, ProtectedOutput) as exc:
+        if isinstance(exc, ProtectedOutput):
+            message = exc
+        else:
+            message = ProtectedOutput(
+                f"could not validate existing output safely: {type(exc).__name__}"
+            )
+        recovery_output: Path | None = None
+        recovery_error: str | None = None
+        request_outcome = (
+            payload.get("request_attempted") is True
+            or payload.get("request_completed") is True
+            or payload.get("may_have_been_billed") is True
+        )
+        if request_outcome:
+            try:
+                recovery_output = write_recovery_json(output, payload)
+            except (OSError, UnicodeError, TypeError, ValueError) as recovery_exc:
+                recovery_error = type(recovery_exc).__name__
+        report = protected_transition_payload(
+            message,
+            payload,
+            output,
+            recovery_output=recovery_output,
+        )
+        if recovery_error is not None:
+            report.update(
+                {
+                    "recovery_write_failed": True,
+                    "recovery_write_error": recovery_error,
+                    "unwritten_payload": redact_rewrite_target_text(payload),
+                }
+            )
+        safe_emit(report, None)
+        return EXIT_CONFIG
 
 
 def main() -> int:
     args = parse_args()
     input_text: str | None = None
+    api_attempt_reserved = False
     live_request_started = False
     try:
         ensure_output_distinct(args.output, [args.input, args.response])
@@ -731,14 +1101,21 @@ def main() -> int:
             raise ConfigurationError("--timeout must be positive")
         if args.response and args.live_api:
             raise ConfigurationError("choose exactly one of --response or --live-api")
-        if not args.response and not args.live_api:
-            raise ConfigurationError("choose exactly one of --response or --live-api")
+        if args.web_response and not args.response:
+            raise ConfigurationError("--web-response requires --response")
         if args.live_api and args.output is None:
             raise ConfigurationError("--output is required with --live-api")
         if args.input:
             input_text = read_text(args.input, MAX_TEXT_BYTES)
             if not input_text.strip():
                 raise InvalidData("input text is empty")
+
+        if not args.response and not args.live_api:
+            if input_text is None:
+                raise ConfigurationError("--input is required for webpage mode")
+            return finish(
+                webpage_handoff_payload(input_text), args.output, EXIT_TEMPORARY
+            )
 
         if args.response:
             if input_text is None:
@@ -747,15 +1124,22 @@ def main() -> int:
             loaded = loads_strict(raw)
             if not isinstance(loaded, dict):
                 raise InvalidData("response root must be an object")
-            source = "saved_response"
+            source = "official_webpage" if args.web_response else "saved_response"
         else:
             if input_text is None:
                 raise ConfigurationError("--input is required in API mode")
-            gateway, api_key = resolve_api_config()
             if args.output is None:  # guarded above; keeps the type invariant explicit.
                 raise ConfigurationError("--output is required with --live-api")
             try:
-                write_json(args.output, submission_intent_payload(input_text))
+                intent = submission_intent_payload(input_text)
+                reserve_submission_intent(args.output, intent)
+                api_attempt_reserved = True
+            except ProtectedOutput as exc:
+                return finish(
+                    protected_transition_payload(exc, intent, args.output),
+                    None,
+                    EXIT_CONFIG,
+                )
             except (OSError, UnicodeError, TypeError, ValueError) as exc:
                 return finish(
                     error_payload(
@@ -766,6 +1150,7 @@ def main() -> int:
                     None,
                     EXIT_INVALID,
                 )
+            gateway, api_key = resolve_api_config()
             live_request_started = True
             loaded = call_api(input_text, args.timeout, gateway, api_key)
             source = "official_api"
@@ -780,6 +1165,7 @@ def main() -> int:
             payload,
             args.output,
             EXIT_PASS if payload["passed"] else EXIT_REVISE,
+            allow_submission_intent=api_attempt_reserved,
         )
     except PendingResult as exc:
         payload = {
@@ -787,6 +1173,9 @@ def main() -> int:
             "scope": "zhuque_detector_gate",
             "checked_at": datetime.now(timezone.utc).isoformat(),
             "verdict": "PENDING",
+            "adapter": (
+                "official_api" if live_request_started else "saved_response_validation"
+            ),
             "passed": False,
             "overall_article_finalizable": False,
             "status": exc.status,
@@ -802,7 +1191,12 @@ def main() -> int:
                     "do_not_retry_same_text": True,
                 }
             )
-        return finish(payload, args.output, EXIT_TEMPORARY)
+        return finish(
+            payload,
+            args.output,
+            EXIT_TEMPORARY,
+            allow_submission_intent=api_attempt_reserved,
+        )
     except BlockedOperation as exc:
         return finish(
             blocked_payload(
@@ -813,12 +1207,14 @@ def main() -> int:
             ),
             args.output,
             EXIT_CONFIG,
+            allow_submission_intent=api_attempt_reserved,
         )
     except ResultUnknown as exc:
         return finish(
             result_unknown_payload(exc.category, str(exc), input_text),
             args.output,
             EXIT_TEMPORARY,
+            allow_submission_intent=api_attempt_reserved,
         )
     except ConfigurationError as exc:
         return finish(
@@ -831,6 +1227,7 @@ def main() -> int:
             ),
             args.output,
             EXIT_CONFIG,
+            allow_submission_intent=api_attempt_reserved,
         )
     except (OSError, UnicodeError, InvalidData) as exc:
         return finish(
@@ -843,6 +1240,7 @@ def main() -> int:
             ),
             args.output,
             EXIT_INVALID,
+            allow_submission_intent=api_attempt_reserved,
         )
     except Exception as exc:  # noqa: BLE001 - CLI boundary must fail closed without a traceback.
         return finish(
@@ -855,6 +1253,7 @@ def main() -> int:
             ),
             args.output,
             EXIT_INVALID,
+            allow_submission_intent=api_attempt_reserved,
         )
 
 

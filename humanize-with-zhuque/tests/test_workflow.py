@@ -8,6 +8,7 @@ import json
 import os
 import sys
 import tempfile
+import threading
 import time
 import unittest
 from pathlib import Path
@@ -508,13 +509,96 @@ class ZhuqueGateTests(unittest.TestCase):
             self.assertTrue(fallback["do_not_retry_same_text"])
             self.assertNotIn("text", fallback["rewrite_targets"][0])
 
-    def test_no_implicit_network_request(self) -> None:
+    def test_default_mode_prepares_official_webpage_without_network(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             input_path = Path(directory) / "candidate.txt"
             input_path.write_text("正文", encoding="utf-8")
-            argv = ["zhuque_gate.py", "--input", str(input_path)]
+            environments = (
+                {},
+                {"ZHUQUE_API_KEY": "key"},
+                {
+                    "ZHUQUE_GATEWAY": "https://gateway.example",
+                    "ZHUQUE_API_KEY": "key",
+                },
+            )
+            for index, environment in enumerate(environments):
+                with self.subTest(environment=environment):
+                    output_path = Path(directory) / f"web-{index}.json"
+                    argv = [
+                        "zhuque_gate.py",
+                        "--input",
+                        str(input_path),
+                        "--output",
+                        str(output_path),
+                    ]
+                    with (
+                        mock.patch.object(sys, "argv", argv),
+                        mock.patch.dict(os.environ, environment, clear=True),
+                        mock.patch.object(
+                            zhuque_gate,
+                            "resolve_api_config",
+                            side_effect=AssertionError("API config was inspected"),
+                        ),
+                        mock.patch.object(
+                            zhuque_gate,
+                            "call_api",
+                            side_effect=AssertionError("network call was attempted"),
+                        ),
+                        contextlib.redirect_stdout(io.StringIO()),
+                    ):
+                        self.assertEqual(
+                            zhuque_gate.main(), zhuque_gate.EXIT_TEMPORARY
+                        )
+                    payload = json.loads(output_path.read_text(encoding="utf-8"))
+                    self.assertEqual(payload["verdict"], "PENDING")
+                    self.assertEqual(payload["status"], "WEBPAGE_RESULT_REQUIRED")
+                    self.assertEqual(payload["adapter"], "official_webpage")
+                    self.assertEqual(payload["webpage_url"], zhuque_gate.OFFICIAL_WEB_URL)
+                    self.assertFalse(payload["api_credentials_required"])
+                    self.assertFalse(payload["request_attempted"])
+                    self.assertTrue(payload["submission_allowed"])
+                    self.assertFalse(payload["retry_allowed"])
+
+    def test_webpage_handoff_can_be_replaced_by_bound_result(self) -> None:
+        text = "正文"
+        with tempfile.TemporaryDirectory() as directory:
+            input_path = Path(directory) / "candidate.txt"
+            response_path = Path(directory) / "visible-result.json"
+            current_path = Path(directory) / "detection-current.json"
+            input_path.write_text(text, encoding="utf-8")
+            response_path.write_text(
+                json.dumps(make_response(text), ensure_ascii=False), encoding="utf-8"
+            )
+
+            handoff_argv = [
+                "zhuque_gate.py",
+                "--input",
+                str(input_path),
+                "--output",
+                str(current_path),
+            ]
             with (
-                mock.patch.object(sys, "argv", argv),
+                mock.patch.object(sys, "argv", handoff_argv),
+                contextlib.redirect_stdout(io.StringIO()),
+            ):
+                self.assertEqual(zhuque_gate.main(), zhuque_gate.EXIT_TEMPORARY)
+            self.assertEqual(
+                json.loads(current_path.read_text(encoding="utf-8"))["status"],
+                "WEBPAGE_RESULT_REQUIRED",
+            )
+
+            response_argv = [
+                "zhuque_gate.py",
+                "--input",
+                str(input_path),
+                "--response",
+                str(response_path),
+                "--web-response",
+                "--output",
+                str(current_path),
+            ]
+            with (
+                mock.patch.object(sys, "argv", response_argv),
                 mock.patch.object(
                     zhuque_gate,
                     "call_api",
@@ -522,7 +606,391 @@ class ZhuqueGateTests(unittest.TestCase):
                 ),
                 contextlib.redirect_stdout(io.StringIO()),
             ):
+                self.assertEqual(zhuque_gate.main(), zhuque_gate.EXIT_PASS)
+            current = json.loads(current_path.read_text(encoding="utf-8"))
+            self.assertEqual(current["verdict"], "PASS")
+            self.assertEqual(current["source"], "official_webpage")
+            self.assertEqual(current["adapter"], "official_webpage")
+            self.assertTrue(current["source_evidence_required"])
+            self.assertFalse(current["source_verified_by_script"])
+            self.assertNotIn("status", current)
+
+    def test_result_unknown_current_state_cannot_be_overwritten(self) -> None:
+        text = "正文"
+        with tempfile.TemporaryDirectory() as directory:
+            input_path = Path(directory) / "candidate.txt"
+            response_path = Path(directory) / "visible-result.json"
+            current_path = Path(directory) / "detection-current.json"
+            input_path.write_text(text, encoding="utf-8")
+            response_path.write_text(
+                json.dumps(make_response(text), ensure_ascii=False), encoding="utf-8"
+            )
+            existing = zhuque_gate.result_unknown_payload(
+                "network_or_timeout", "request outcome is unknown", text
+            )
+            current_path.write_text(
+                json.dumps(existing, ensure_ascii=False, sort_keys=True), encoding="utf-8"
+            )
+            before = current_path.read_bytes()
+            argv = [
+                "zhuque_gate.py",
+                "--input",
+                str(input_path),
+                "--response",
+                str(response_path),
+                "--web-response",
+                "--output",
+                str(current_path),
+            ]
+            stdout = io.StringIO()
+            with (
+                mock.patch.object(sys, "argv", argv),
+                contextlib.redirect_stdout(stdout),
+            ):
                 self.assertEqual(zhuque_gate.main(), zhuque_gate.EXIT_CONFIG)
+            self.assertEqual(current_path.read_bytes(), before)
+            refusal = json.loads(stdout.getvalue())
+            self.assertEqual(refusal["verdict"], "ERROR")
+            self.assertEqual(
+                refusal["error_category"], "protected_output_transition"
+            )
+
+    def test_stale_submission_intent_blocks_a_new_live_request(self) -> None:
+        text = "正文"
+        with tempfile.TemporaryDirectory() as directory:
+            input_path = Path(directory) / "candidate.txt"
+            current_path = Path(directory) / "detection-current.json"
+            input_path.write_text(text, encoding="utf-8")
+            current_path.write_text(
+                json.dumps(
+                    zhuque_gate.submission_intent_payload(text), ensure_ascii=False
+                ),
+                encoding="utf-8",
+            )
+            before = current_path.read_bytes()
+            argv = [
+                "zhuque_gate.py",
+                "--live-api",
+                "--input",
+                str(input_path),
+                "--output",
+                str(current_path),
+            ]
+            with (
+                mock.patch.object(sys, "argv", argv),
+                mock.patch.object(
+                    zhuque_gate,
+                    "resolve_api_config",
+                    return_value=("https://gateway.example", "key"),
+                ),
+                mock.patch.object(
+                    zhuque_gate,
+                    "call_api",
+                    side_effect=AssertionError("duplicate API request was attempted"),
+                ),
+                contextlib.redirect_stdout(io.StringIO()),
+            ):
+                self.assertEqual(zhuque_gate.main(), zhuque_gate.EXIT_CONFIG)
+            self.assertEqual(current_path.read_bytes(), before)
+
+    def test_billable_error_without_adapter_cannot_be_overwritten(self) -> None:
+        text = "正文"
+        with tempfile.TemporaryDirectory() as directory:
+            input_path = Path(directory) / "candidate.txt"
+            response_path = Path(directory) / "visible-result.json"
+            current_path = Path(directory) / "detection-current.json"
+            input_path.write_text(text, encoding="utf-8")
+            response_path.write_text(
+                json.dumps(make_response(text), ensure_ascii=False), encoding="utf-8"
+            )
+            existing = zhuque_gate.error_payload(
+                "invalid_data",
+                "response failed after submission",
+                text,
+                request_attempted=True,
+                may_have_been_billed=True,
+            )
+            self.assertNotIn("adapter", existing)
+            current_path.write_text(
+                json.dumps(existing, ensure_ascii=False), encoding="utf-8"
+            )
+            before = current_path.read_bytes()
+            argv = [
+                "zhuque_gate.py",
+                "--input",
+                str(input_path),
+                "--response",
+                str(response_path),
+                "--web-response",
+                "--output",
+                str(current_path),
+            ]
+            with (
+                mock.patch.object(sys, "argv", argv),
+                contextlib.redirect_stdout(io.StringIO()),
+            ):
+                self.assertEqual(zhuque_gate.main(), zhuque_gate.EXIT_CONFIG)
+            self.assertEqual(current_path.read_bytes(), before)
+
+    def test_api_blocker_can_be_replaced_by_webpage_result(self) -> None:
+        text = "正文"
+        with tempfile.TemporaryDirectory() as directory:
+            input_path = Path(directory) / "candidate.txt"
+            response_path = Path(directory) / "visible-result.json"
+            current_path = Path(directory) / "detection-current.json"
+            input_path.write_text(text, encoding="utf-8")
+            response_path.write_text(
+                json.dumps(make_response(text), ensure_ascii=False), encoding="utf-8"
+            )
+            current_path.write_text(
+                json.dumps(
+                    zhuque_gate.blocked_payload(
+                        "missing_api_key",
+                        "API key is missing",
+                        text,
+                        request_attempted=False,
+                    ),
+                    ensure_ascii=False,
+                ),
+                encoding="utf-8",
+            )
+            argv = [
+                "zhuque_gate.py",
+                "--input",
+                str(input_path),
+                "--response",
+                str(response_path),
+                "--web-response",
+                "--output",
+                str(current_path),
+            ]
+            with (
+                mock.patch.object(sys, "argv", argv),
+                contextlib.redirect_stdout(io.StringIO()),
+            ):
+                self.assertEqual(zhuque_gate.main(), zhuque_gate.EXIT_PASS)
+            current = json.loads(current_path.read_text(encoding="utf-8"))
+            self.assertEqual(current["verdict"], "PASS")
+            self.assertEqual(current["adapter"], "official_webpage")
+
+    def test_api_config_reports_each_missing_variable(self) -> None:
+        cases = (
+            ({}, "missing_api_credentials"),
+            ({"ZHUQUE_GATEWAY": "https://gateway.example"}, "missing_api_key"),
+            ({"ZHUQUE_API_KEY": "key"}, "missing_api_gateway"),
+        )
+        for environment, category in cases:
+            with self.subTest(environment=environment):
+                with (
+                    mock.patch.dict(os.environ, environment, clear=True),
+                    self.assertRaises(zhuque_gate.BlockedOperation) as caught,
+                ):
+                    zhuque_gate.resolve_api_config()
+                self.assertEqual(caught.exception.category, category)
+
+    def test_live_api_flag_does_not_accept_abbreviations(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            input_path = Path(directory) / "candidate.txt"
+            output_path = Path(directory) / "result.json"
+            input_path.write_text("正文", encoding="utf-8")
+            for abbreviated in ("--l", "--live"):
+                with self.subTest(flag=abbreviated):
+                    argv = [
+                        "zhuque_gate.py",
+                        abbreviated,
+                        "--input",
+                        str(input_path),
+                        "--output",
+                        str(output_path),
+                    ]
+                    with (
+                        mock.patch.object(sys, "argv", argv),
+                        mock.patch.object(
+                            zhuque_gate,
+                            "call_api",
+                            side_effect=AssertionError("network call was attempted"),
+                        ),
+                        contextlib.redirect_stderr(io.StringIO()),
+                        self.assertRaises(SystemExit) as caught,
+                    ):
+                        zhuque_gate.main()
+                    self.assertEqual(caught.exception.code, 2)
+                    self.assertFalse(output_path.exists())
+
+    def test_api_submission_path_is_reserved_atomically(self) -> None:
+        text = "正文"
+        with tempfile.TemporaryDirectory() as directory:
+            output_path = Path(directory) / "api-attempt.json"
+            payload = zhuque_gate.submission_intent_payload(text)
+            barrier = threading.Barrier(2)
+            outcomes: list[str] = []
+
+            def reserve() -> None:
+                barrier.wait()
+                try:
+                    zhuque_gate.reserve_submission_intent(output_path, payload)
+                except zhuque_gate.ProtectedOutput:
+                    outcomes.append("blocked")
+                else:
+                    outcomes.append("reserved")
+
+            threads = [threading.Thread(target=reserve) for _ in range(2)]
+            for thread in threads:
+                thread.start()
+            for thread in threads:
+                thread.join(timeout=5)
+                self.assertFalse(thread.is_alive())
+
+            self.assertCountEqual(outcomes, ["reserved", "blocked"])
+            saved = json.loads(output_path.read_text(encoding="utf-8"))
+            self.assertEqual(saved["verdict"], "SUBMISSION_INTENT")
+            self.assertEqual(saved["input_sha256"], hashlib.sha256(text.encode()).hexdigest())
+
+    def test_lock_contention_message_is_request_neutral(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            output_path = Path(directory) / "shared-output.json"
+            with (
+                zhuque_gate.output_lock(output_path),
+                self.assertRaises(zhuque_gate.ProtectedOutput) as caught,
+                zhuque_gate.output_lock(output_path),
+            ):
+                self.fail("the second writer unexpectedly acquired the lock")
+            self.assertNotIn("no request was made", str(caught.exception))
+
+    def test_finish_locks_transition_through_write(self) -> None:
+        text = "正文"
+        with tempfile.TemporaryDirectory() as directory:
+            output_path = Path(directory) / "shared-output.json"
+            transition_checked = threading.Event()
+            release_finish = threading.Event()
+            outcomes: list[int] = []
+            original = zhuque_gate.ensure_output_transition
+
+            def pause_after_check(*args, **kwargs) -> None:
+                original(*args, **kwargs)
+                transition_checked.set()
+                if not release_finish.wait(timeout=5):
+                    raise AssertionError("test did not release finish")
+
+            def write_webpage_handoff() -> None:
+                outcomes.append(
+                    zhuque_gate.finish(
+                        zhuque_gate.webpage_handoff_payload(text),
+                        output_path,
+                        zhuque_gate.EXIT_TEMPORARY,
+                    )
+                )
+
+            with (
+                mock.patch.object(
+                    zhuque_gate,
+                    "ensure_output_transition",
+                    side_effect=pause_after_check,
+                ),
+                contextlib.redirect_stdout(io.StringIO()),
+            ):
+                writer = threading.Thread(target=write_webpage_handoff)
+                writer.start()
+                self.assertTrue(transition_checked.wait(timeout=5))
+                try:
+                    with self.assertRaises(zhuque_gate.ProtectedOutput):
+                        zhuque_gate.reserve_submission_intent(
+                            output_path,
+                            zhuque_gate.submission_intent_payload(text),
+                        )
+                finally:
+                    release_finish.set()
+                writer.join(timeout=5)
+                self.assertFalse(writer.is_alive())
+
+            self.assertEqual(outcomes, [zhuque_gate.EXIT_TEMPORARY])
+            saved = json.loads(output_path.read_text(encoding="utf-8"))
+            self.assertEqual(saved["status"], "WEBPAGE_RESULT_REQUIRED")
+
+    def test_post_request_lock_timeout_preserves_recovery_result(self) -> None:
+        text = "正文"
+        with tempfile.TemporaryDirectory() as directory:
+            output_path = Path(directory) / "api-attempt.json"
+            intent = zhuque_gate.submission_intent_payload(text)
+            output_path.write_text(json.dumps(intent), encoding="utf-8")
+            result = zhuque_gate.result_unknown_payload(
+                "network_or_timeout", "request outcome is unknown", text
+            )
+            stdout = io.StringIO()
+            with (
+                mock.patch.object(
+                    zhuque_gate,
+                    "output_lock",
+                    side_effect=zhuque_gate.ProtectedOutput("lock stayed busy"),
+                ),
+                contextlib.redirect_stdout(stdout),
+            ):
+                self.assertEqual(
+                    zhuque_gate.finish(
+                        result,
+                        output_path,
+                        zhuque_gate.EXIT_TEMPORARY,
+                        allow_submission_intent=True,
+                    ),
+                    zhuque_gate.EXIT_CONFIG,
+                )
+
+            self.assertEqual(
+                json.loads(output_path.read_text(encoding="utf-8"))["verdict"],
+                "SUBMISSION_INTENT",
+            )
+            report = json.loads(stdout.getvalue())
+            self.assertNotIn("no request was made", report["error"])
+            self.assertTrue(report["request_attempted"])
+            self.assertTrue(report["may_have_been_billed"])
+            self.assertTrue(report["do_not_retry_same_text"])
+            recovery = Path(report["recovery_output"])
+            self.assertEqual(json.loads(recovery.read_text(encoding="utf-8")), result)
+
+    def test_recovery_write_failure_redacts_nested_segment_text(self) -> None:
+        secret = "CUSTOMER-SECRET-123"
+        with tempfile.TemporaryDirectory() as directory:
+            output_path = Path(directory) / "api-attempt.json"
+            result = zhuque_gate.evaluate(
+                make_response(secret, label=2),
+                input_text=secret,
+                source="official_api",
+                include_segment_text=True,
+            )
+            self.assertEqual(result["rewrite_targets"][0]["text"], secret)
+            stdout = io.StringIO()
+            with (
+                mock.patch.object(
+                    zhuque_gate,
+                    "output_lock",
+                    side_effect=zhuque_gate.ProtectedOutput("lock stayed busy"),
+                ),
+                mock.patch.object(
+                    zhuque_gate,
+                    "write_recovery_json",
+                    side_effect=OSError("disk unavailable"),
+                ),
+                contextlib.redirect_stdout(stdout),
+            ):
+                self.assertEqual(
+                    zhuque_gate.finish(
+                        result,
+                        output_path,
+                        zhuque_gate.EXIT_TEMPORARY,
+                        allow_submission_intent=True,
+                    ),
+                    zhuque_gate.EXIT_CONFIG,
+                )
+
+            raw_report = stdout.getvalue()
+            self.assertNotIn(secret, raw_report)
+            report = json.loads(raw_report)
+            self.assertTrue(report["recovery_write_failed"])
+            target = report["unwritten_payload"]["rewrite_targets"][0]
+            self.assertNotIn("text", target)
+            self.assertEqual(target["position"], [0, len(secret)])
+            self.assertTrue(report["may_have_been_billed"])
+            self.assertTrue(report["do_not_retry_same_text"])
 
     def test_live_api_requires_explicit_mode_and_preserves_result(self) -> None:
         text = "正文"
@@ -563,6 +1031,7 @@ class ZhuqueGateTests(unittest.TestCase):
                 self.assertEqual(zhuque_gate.main(), zhuque_gate.EXIT_PASS)
             result = json.loads(output_path.read_text(encoding="utf-8"))
             self.assertEqual(result["verdict"], "PASS")
+            self.assertEqual(result["adapter"], "official_api")
             self.assertTrue(result["request_completed"])
             self.assertTrue(result["do_not_retry_same_text"])
 
@@ -581,24 +1050,42 @@ class ZhuqueGateTests(unittest.TestCase):
                 str(output_path),
             ]
 
+            def missing_config():
+                reserved = json.loads(output_path.read_text(encoding="utf-8"))
+                self.assertEqual(reserved["verdict"], "SUBMISSION_INTENT")
+                raise zhuque_gate.BlockedOperation(
+                    "missing_api_credentials", "credentials are missing"
+                )
+
             with (
                 mock.patch.object(sys, "argv", argv),
                 mock.patch.object(
                     zhuque_gate,
                     "resolve_api_config",
-                    side_effect=zhuque_gate.BlockedOperation(
-                        "missing_credentials", "credentials are missing"
-                    ),
+                    side_effect=missing_config,
                 ),
                 contextlib.redirect_stdout(io.StringIO()),
             ):
                 self.assertEqual(zhuque_gate.main(), zhuque_gate.EXIT_CONFIG)
             blocked = json.loads(output_path.read_text(encoding="utf-8"))
             self.assertEqual(blocked["verdict"], "BLOCKED")
+            self.assertEqual(blocked["adapter"], "official_api")
+            self.assertEqual(blocked["blocker_scope"], "official_api")
+            self.assertEqual(blocked["fallback_adapter"], "official_webpage")
+            self.assertEqual(blocked["fallback_url"], zhuque_gate.OFFICIAL_WEB_URL)
             self.assertFalse(blocked["request_attempted"])
 
+            unknown_output_path = Path(directory) / "result-unknown.json"
+            unknown_argv = [
+                "zhuque_gate.py",
+                "--live-api",
+                "--input",
+                str(input_path),
+                "--output",
+                str(unknown_output_path),
+            ]
             with (
-                mock.patch.object(sys, "argv", argv),
+                mock.patch.object(sys, "argv", unknown_argv),
                 mock.patch.object(
                     zhuque_gate,
                     "resolve_api_config",
@@ -614,10 +1101,12 @@ class ZhuqueGateTests(unittest.TestCase):
                 contextlib.redirect_stdout(io.StringIO()),
             ):
                 self.assertEqual(zhuque_gate.main(), zhuque_gate.EXIT_TEMPORARY)
-            unknown = json.loads(output_path.read_text(encoding="utf-8"))
+            unknown = json.loads(unknown_output_path.read_text(encoding="utf-8"))
             self.assertEqual(unknown["verdict"], "RESULT_UNKNOWN")
+            self.assertEqual(unknown["adapter"], "official_api")
             self.assertTrue(unknown["may_have_been_billed"])
             self.assertFalse(unknown["retry_allowed"])
+            self.assertNotIn("fallback_adapter", unknown)
 
     def test_saved_response_mode_never_builds_network_opener(self) -> None:
         text = "正文"
