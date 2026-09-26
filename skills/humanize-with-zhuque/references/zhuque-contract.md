@@ -38,7 +38,7 @@ API 通过 EdgeOne Makers 提供。截至上述核对日期，中国站文档说
 ```json
 {
   "status": "success",
-  "labels_ratio": {"0": 0.81, "1": 0.0001, "2": 0.1899},
+  "labels_ratio": {"0": 1.0, "1": 0.0, "2": 0.0},
   "segment_labels": [
     {"label": 0, "conf": 0.93, "order": 1, "position": [0, 120], "text": "..."}
   ]
@@ -60,13 +60,15 @@ API 通过 EdgeOne Makers 提供。截至上述核对日期，中国站文档说
 
 ```text
 status == success
-labels_ratio["0"] >= 0.80
-labels_ratio["2"] < 0.20
-labels_ratio["1"] <= 0.001
-segment_labels 中没有 label == 1
+labels_ratio["0"] == 1
+labels_ratio["2"] == 0
+labels_ratio["1"] == 0
+segment_labels 中所有分段均为 label == 0
 ```
 
-不要要求 `labels_ratio["1"] == 0`。官方示例在没有 `label == 1` 分段时仍可能返回 `0.0001`，属于平滑或舍入。本 Skill 允许的聚合 AI 噪声上限为 `0.001`（0.1%）；超过即不通过，即使分段漏标也不能放行。任何 `label == 1` 分段同样直接不通过。`0.001` 是本 Skill 为落实“没有确定 AI”而采用的保守产品策略，不是腾讯官方承诺的平滑上限。
+本 Skill 按“人工内容 100%”的字面要求严格验收，不接受平滑或舍入噪声。即使 AI 或疑似 AI 比例只有 `0.0001` 也不通过；任何 `label == 1` 或 `label == 2` 分段也直接不通过。汇总比例与分段结果互相矛盾时失败关闭，不用其中一项覆盖另一项。
+
+检测证书和边界判断使用输出中的 `passed`、`failed_checks` 与 `*_percent_exact` 字段。兼容保留的数值型百分比字段经过四位小数显示舍入，不能单独作为是否达到 100% 的依据。
 
 `softmax_confidence` 和 `ratio_confidence` 不是用户设定的验收条件，不得代替上述条件。
 

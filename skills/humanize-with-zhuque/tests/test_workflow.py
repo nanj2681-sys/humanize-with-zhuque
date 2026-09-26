@@ -34,9 +34,9 @@ zhuque_gate = load_module("tested_zhuque_gate", SKILL_ROOT / "scripts/zhuque_gat
 def make_response(
     text: str,
     *,
-    human: float = 0.8,
-    ai: float = 0.0001,
-    suspected: float = 0.1999,
+    human: float = 1.0,
+    ai: float = 0.0,
+    suspected: float = 0.0,
     label: int = 0,
 ) -> dict[str, object]:
     return {
@@ -316,19 +316,39 @@ class ZhuqueGateTests(unittest.TestCase):
         self.assertEqual(
             result["input_binding"], "segment_text_and_position+declared_sha256"
         )
+        self.assertEqual(
+            result["threshold_version"],
+            "human==1;suspected==0;aggregate-ai==0;no-segment-label-1-or-2",
+        )
 
-    def test_twenty_percent_suspected_fails(self) -> None:
+    def test_any_suspected_ratio_fails(self) -> None:
         result = self.evaluate_saved(
-            make_response("正文", human=0.8, ai=0.0, suspected=0.2), "正文"
+            make_response("正文", human=0.9999, ai=0.0, suspected=0.0001), "正文"
         )
         self.assertFalse(result["passed"])
-        self.assertIn("suspected_ai_below_20_percent", result["failed_checks"])
+        self.assertIn("human_content_is_100_percent", result["failed_checks"])
+        self.assertIn("suspected_ai_is_zero", result["failed_checks"])
 
-    def test_ratio_sum_exact_tolerance_boundary_is_stable(self) -> None:
+    def test_nonzero_aggregate_ai_noise_fails(self) -> None:
         result = self.evaluate_saved(
-            make_response("正文", human=0.8, ai=0.001, suspected=0.198), "正文"
+            make_response("正文", human=0.999, ai=0.001, suspected=0.0), "正文"
         )
-        self.assertTrue(result["passed"])
+        self.assertFalse(result["passed"])
+        self.assertIn("human_content_is_100_percent", result["failed_checks"])
+        self.assertIn("aggregate_ai_is_zero", result["failed_checks"])
+
+    def test_ratio_sum_tolerance_never_relaxes_the_pass_gate(self) -> None:
+        boundary = self.evaluate_saved(
+            make_response("正文", human=1.0, ai=0.001, suspected=0.0), "正文"
+        )
+        self.assertFalse(boundary["passed"])
+        self.assertIn("aggregate_ai_is_zero", boundary["failed_checks"])
+
+        with self.assertRaises(zhuque_gate.InvalidData):
+            self.evaluate_saved(
+                make_response("正文", human=1.0, ai=0.0011, suspected=0.0),
+                "正文",
+            )
 
     def test_json_decimal_precision_cannot_round_across_thresholds(self) -> None:
         text = "正文"
@@ -341,41 +361,54 @@ class ZhuqueGateTests(unittest.TestCase):
             '{"input_sha256":"'
             + digest
             + '","status":"success","labels_ratio":'
-            + '{"0":0.79999999999999999,"1":0.0001,'
-            + '"2":0.19990000000000001},'
+            + '{"0":0.99999999999999999,"1":0,'
+            + '"2":0.00000000000000001},'
             + segment
             + "}"
         )
-        self.assertFalse(self.evaluate_saved(human_below, text)["passed"])
+        human_below_result = self.evaluate_saved(human_below, text)
+        self.assertFalse(human_below_result["passed"])
+        self.assertEqual(
+            human_below_result["metrics"]["human_percent_exact"],
+            "99.99999999999999900",
+        )
 
-        ai_above = zhuque_gate.loads_strict(
+        ai_above_zero = zhuque_gate.loads_strict(
             '{"input_sha256":"'
             + digest
             + '","status":"success","labels_ratio":'
-            + '{"0":0.8,"1":0.00100000000000000001,'
-            + '"2":0.19899999999999999999},'
+            + '{"0":0.99999999999999999,"1":0.00000000000000001,'
+            + '"2":0},'
             + segment
             + "}"
         )
-        result = self.evaluate_saved(ai_above, text)
+        result = self.evaluate_saved(ai_above_zero, text)
         self.assertFalse(result["passed"])
-        self.assertIn("aggregate_ai_within_noise_tolerance", result["failed_checks"])
+        self.assertIn("aggregate_ai_is_zero", result["failed_checks"])
 
     def test_definite_ai_segment_fails(self) -> None:
         result = self.evaluate_saved(
-            make_response("正文", human=0.8, ai=0.1, suspected=0.1, label=1),
+            make_response("正文", human=1.0, ai=0.0, suspected=0.0, label=1),
             "正文",
         )
         self.assertFalse(result["passed"])
         self.assertIn("no_definite_ai_segments", result["failed_checks"])
 
-    def test_large_aggregate_ai_ratio_fails_even_without_ai_segment(self) -> None:
+    def test_suspected_ai_segment_fails_even_with_zero_suspected_ratio(self) -> None:
+        result = self.evaluate_saved(
+            make_response("正文", human=1.0, ai=0.0, suspected=0.0, label=2),
+            "正文",
+        )
+        self.assertFalse(result["passed"])
+        self.assertIn("no_suspected_ai_segments", result["failed_checks"])
+
+    def test_nonzero_aggregate_ai_ratio_fails_without_ai_segment(self) -> None:
         result = self.evaluate_saved(
             make_response("正文", human=0.8, ai=0.2, suspected=0.0, label=0),
             "正文",
         )
         self.assertFalse(result["passed"])
-        self.assertIn("aggregate_ai_within_noise_tolerance", result["failed_checks"])
+        self.assertIn("aggregate_ai_is_zero", result["failed_checks"])
 
     def test_self_declared_hash_does_not_override_stale_segments(self) -> None:
         text = "当前正文"

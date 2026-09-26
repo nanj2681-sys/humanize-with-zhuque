@@ -49,7 +49,6 @@ MAX_TEXT_BYTES = 10 * 1024 * 1024
 MAX_RESPONSE_BYTES = 10 * 1024 * 1024
 MAX_SEGMENTS = 20_000
 RATIO_SUM_TOLERANCE = Decimal("0.001")
-AGGREGATE_AI_NOISE_MAX = Decimal("0.001")
 OFFICIAL_WEB_URL = "https://matrix.tencent.com/ai-detect/ai_gen"
 
 
@@ -681,19 +680,28 @@ def evaluate(
     definite = [item for item in normalized_segments if item["label"] == 1]
     suspicious = [item for item in normalized_segments if item["label"] == 2]
     checks = {
-        "human_at_least_80_percent": human >= Decimal("0.80"),
-        "suspected_ai_below_20_percent": suspected < Decimal("0.20"),
-        "aggregate_ai_within_noise_tolerance": ai <= AGGREGATE_AI_NOISE_MAX,
+        "human_content_is_100_percent": human == Decimal(1),
+        "suspected_ai_is_zero": suspected == Decimal(0),
+        "aggregate_ai_is_zero": ai == Decimal(0),
         "no_definite_ai_segments": not definite,
+        "no_suspected_ai_segments": not suspicious,
     }
     failed_checks = [name for name, passed in checks.items() if not passed]
-    if 0 < ai <= AGGREGATE_AI_NOISE_MAX and not definite:
+    if ai > 0 and not definite:
         warnings.append(
-            "aggregate AI ratio is non-zero but within the allowed smoothing tolerance"
+            "aggregate AI ratio is non-zero despite no segment label 1"
         )
-    elif ai > AGGREGATE_AI_NOISE_MAX and not definite:
+    elif ai == 0 and definite:
         warnings.append(
-            "aggregate AI ratio exceeds the smoothing tolerance despite no segment label 1"
+            "segment label 1 exists despite a zero aggregate AI ratio"
+        )
+    if suspected > 0 and not suspicious:
+        warnings.append(
+            "suspected AI ratio is non-zero despite no segment label 2"
+        )
+    elif suspected == 0 and suspicious:
+        warnings.append(
+            "segment label 2 exists despite a zero suspected AI ratio"
         )
 
     if input_text is not None:
@@ -716,7 +724,7 @@ def evaluate(
     result = {
         "schema_version": 1,
         "scope": "zhuque_detector_gate",
-        "threshold_version": "human>=0.80;suspected<0.20;aggregate-ai<=0.001;no-segment-label-1",
+        "threshold_version": "human==1;suspected==0;aggregate-ai==0;no-segment-label-1-or-2",
         "checked_at": datetime.now(timezone.utc).isoformat(),
         "source": source,
         "adapter": {
@@ -738,6 +746,9 @@ def evaluate(
             "human_ratio_exact": str(human),
             "ai_ratio_exact": str(ai),
             "suspected_ai_ratio_exact": str(suspected),
+            "human_percent_exact": str(human * 100),
+            "ai_percent_exact": str(ai * 100),
+            "suspected_ai_percent_exact": str(suspected * 100),
             "human_percent": round(float(human * 100), 4),
             "ai_percent": round(float(ai * 100), 4),
             "suspected_ai_percent": round(float(suspected * 100), 4),
