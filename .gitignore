@@ -6,6 +6,7 @@ __pycache__/
 .pytest_cache/
 .ruff_cache/
 *.skill.zip
+*.plugin.zip
 candidate-*.txt
 detection-*.json
 fact-check-*.json

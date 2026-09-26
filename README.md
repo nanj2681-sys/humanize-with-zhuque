@@ -1,6 +1,6 @@
 # Humanize with Zhuque
 
-一个面向 Codex 的中文文章去 AI 味 Skill。它把事实守恒、公文文种检查、腾讯朱雀全文检测和定向重写组合成有停止条件、可审计的工作流。
+一个面向 Codex 的中文文章去 AI 味插件，内含同名 Skill。它把事实守恒、公文文种检查、腾讯朱雀全文检测和定向重写组合成有停止条件、可审计的工作流。
 
 > 朱雀结果只是文本特征检测信号，不能证明作者身份、原创性或版权归属。
 
@@ -25,25 +25,36 @@
 
 ```text
 humanize-with-zhuque/
-├── SKILL.md
-├── agents/openai.yaml
-├── references/
-│   ├── government-report-rules.md
-│   └── zhuque-contract.md
-├── scripts/
-│   ├── fact_guard.py
-│   └── zhuque_gate.py
-└── tests/test_workflow.py
+├── .codex-plugin/plugin.json
+├── skills/
+│   └── humanize-with-zhuque/
+│       ├── SKILL.md
+│       ├── agents/openai.yaml
+│       ├── references/
+│       │   ├── government-report-rules.md
+│       │   └── zhuque-contract.md
+│       ├── scripts/
+│       │   ├── fact_guard.py
+│       │   └── zhuque_gate.py
+│       └── tests/test_workflow.py
+├── LICENSE
+└── THIRD_PARTY_NOTICES.md
 ```
 
 ## 安装
 
 要求 Python 3.11 或更高版本。
 
+仓库根目录现在是标准 Codex 插件，可登记到 Codex marketplace 后安装。插件清单位于 `.codex-plugin/plugin.json`，实际 Skill 位于 `skills/humanize-with-zhuque/`。安装或更新插件后，请新建 Codex 任务，使新的 Skill 版本生效。
+
+如只需要传统的独立 Skill，可使用：
+
 ```bash
 git clone https://github.com/nanj2681-sys/humanize-with-zhuque.git
-cp -R humanize-with-zhuque/humanize-with-zhuque ~/.codex/skills/
+cp -R humanize-with-zhuque/skills/humanize-with-zhuque ~/.codex/skills/
 ```
+
+插件安装与独立 Skill 安装应二选一，不要同时启用两份 `humanize-with-zhuque`，以免 Codex 发现重复能力或后续更新发生版本漂移。
 
 重新打开 Codex 后，可直接调用：
 
@@ -78,7 +89,7 @@ mkdir -p run-artifacts
 建立事实清单：
 
 ```bash
-python3 humanize-with-zhuque/scripts/fact_guard.py snapshot \
+python3 skills/humanize-with-zhuque/scripts/fact_guard.py snapshot \
   --input run-artifacts/original-canonical.txt \
   --output run-artifacts/fact-ledger.json \
   --protect-file run-artifacts/protected-terms.txt
@@ -87,7 +98,7 @@ python3 humanize-with-zhuque/scripts/fact_guard.py snapshot \
 检查候选稿：
 
 ```bash
-python3 humanize-with-zhuque/scripts/fact_guard.py check \
+python3 skills/humanize-with-zhuque/scripts/fact_guard.py check \
   --input run-artifacts/candidate-01.txt \
   --manifest run-artifacts/fact-ledger.json \
   --output run-artifacts/fact-check-01.json
@@ -96,7 +107,7 @@ python3 humanize-with-zhuque/scripts/fact_guard.py check \
 默认网页通道先生成不联网的浏览器交接状态：
 
 ```bash
-python3 humanize-with-zhuque/scripts/zhuque_gate.py \
+python3 skills/humanize-with-zhuque/scripts/zhuque_gate.py \
   --input run-artifacts/candidate-01.txt \
   --output run-artifacts/detection-current.json
 ```
@@ -106,7 +117,7 @@ python3 humanize-with-zhuque/scripts/zhuque_gate.py \
 将网页可见结果规范化后，离线评估并更新当前状态：
 
 ```bash
-python3 humanize-with-zhuque/scripts/zhuque_gate.py \
+python3 skills/humanize-with-zhuque/scripts/zhuque_gate.py \
   --response run-artifacts/visible-zhuque-result.json \
   --web-response \
   --input run-artifacts/candidate-01.txt \
@@ -121,7 +132,7 @@ python3 humanize-with-zhuque/scripts/zhuque_gate.py \
 export ZHUQUE_GATEWAY="https://ai-gateway.edgeone.link"
 export ZHUQUE_API_KEY="<YOUR_API_KEY>"
 
-python3 humanize-with-zhuque/scripts/zhuque_gate.py \
+python3 skills/humanize-with-zhuque/scripts/zhuque_gate.py \
   --live-api \
   --input run-artifacts/candidate-01.txt \
   --output run-artifacts/detection-api-attempt-01.json
@@ -135,7 +146,7 @@ python3 humanize-with-zhuque/scripts/zhuque_gate.py \
 
 ```bash
 python3 -m unittest discover \
-  -s humanize-with-zhuque/tests \
+  -s skills/humanize-with-zhuque/tests \
   -v
 ```
 
