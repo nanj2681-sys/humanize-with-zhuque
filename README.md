@@ -35,7 +35,8 @@ humanize-with-zhuque/
 │       ├── agents/openai.yaml
 │       ├── references/
 │       │   ├── government-report-rules.md
-│       │   └── zhuque-contract.md
+│       │   ├── zhuque-contract.md
+│       │   └── notices.md
 │       ├── scripts/
 │       │   ├── fact_guard.py
 │       │   └── zhuque_gate.py

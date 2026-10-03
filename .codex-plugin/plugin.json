@@ -1,6 +1,6 @@
 {
   "name": "humanize-with-zhuque",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "description": "在事实守恒和文种约束下改写中文文章，并通过腾讯朱雀执行有边界、可审计的检测流程。",
   "author": {
     "name": "nanj2681-sys",

@@ -1,6 +1,15 @@
 ---
 name: humanize-with-zhuque
-description: Draft or revise Chinese articles, especially government reports and formal materials, under strict fact-preservation and document-type rules, then use Tencent Zhuque text detection in a bounded rewrite-and-detect loop until the reported human-content ratio is exactly 100 percent, both suspected-AI and AI ratios are zero, and every returned segment is classified as human. Use when a user asks to 写文章后去 AI 味, run 朱雀检测, reach 人工内容 100%, or iteratively humanize TXT, Markdown, or DOCX articles.
+description: >-
+  Draft or revise Chinese articles under strict fact-preservation and document-genre rules, then run Tencent Zhuque detection in a bounded rewrite-and-detect loop until the reported human ratio is exactly 100 percent and both suspected-AI and AI ratios are zero. Triggers: 去 AI 味, 过朱雀检测, 人工内容 100%.
+metadata:
+  display_name: 朱雀文章去 AI 味
+  display_name_en: Humanize with Zhuque
+  description_zh: 在事实守恒与公文文种约束下改写中文文章，用腾讯朱雀检测做有限轮次的改写—检测循环，要求人工内容达到 100%、疑似 AI 与 AI 比例均为 0，再复核事实与格式后才可定稿。适用于写文章去 AI 味、过朱雀检测、汇报材料润色。
+  description_en: Rewrite Chinese articles under strict fact-preservation and document-genre rules, then use Tencent Zhuque detection in a bounded rewrite-and-detect loop until the reported human ratio reaches exactly 100 percent and no segment is suspected or definite AI.
+  category: writing
+  version: 0.2.1
+  author: 江南
 ---
 
 # Humanize With Zhuque
@@ -13,11 +22,12 @@ Produce a natural, document-appropriate Chinese final draft from an approved fac
 
 - Read [references/government-report-rules.md](references/government-report-rules.md) for government reports, official documents, work summaries, speeches, research reports, notices, requests, and similar formal materials.
 - Read [references/zhuque-contract.md](references/zhuque-contract.md) before interpreting Zhuque results or calling the official API.
-- Use the installed `humanizer-chinese` skill as an optional second-pass pattern scan. Apply its public-document exemptions. The user's rules and the source document's genre take priority.
+- Optional second pass: if the runtime provides a Chinese AI-pattern scanning skill, use it as an extra pattern scan and apply its public-document exemptions. If none is available, apply the AI-pattern checklist in section 4 directly. The user's rules and the source document's genre take priority.
+- Read [references/notices.md](references/notices.md) for the non-affiliation notice, scope boundaries, and third-party attribution. This is a community tool: **never describe it as an official Tencent product or imply Tencent endorsement**, and never present a Zhuque result as proof of authorship.
 
 Resolve every `scripts/...` path below relative to this `SKILL.md` directory and invoke the resulting absolute path. Keep article and audit artifacts in the user's task workspace.
 
-The helper scripts require Python 3.11 or newer. Use Codex's bundled Python runtime when the system `python3` is older.
+The helper scripts require Python 3.11 or newer. If the system `python3` is older, use an interpreter that meets the requirement — on WorkBuddy that is `~/.workbuddy/binaries/python/envs/default/bin/python`; on other runtimes, their bundled Python.
 
 ## Enforce all final gates
 
@@ -30,7 +40,7 @@ Call a draft final only when every condition is true:
 5. Every item in `segment_labels` has `label == 0`; any `label == 1` or `label == 2` fails.
 6. The fact-preservation check has no unresolved change.
 7. The genre, structure, and language review scores at least 80 out of 100 under the supplied rubric.
-8. The requested output file has passed its own format validation. For DOCX, render and inspect every page with the `documents` skill.
+8. The requested output file has passed its own format validation. For DOCX, render and inspect every page with the runtime's document tooling (on WorkBuddy, the `tencent-docx` skill; otherwise `python-docx` plus a renderer).
 
 Apply the 100 percent requirement literally. Even a tiny nonzero AI or suspected-AI ratio, such as a smoothed `0.0001`, fails. A ratio/segment contradiction also fails closed: zero aggregate AI does not override an AI-labeled segment, and zero suspected AI does not override a suspected-AI segment.
 
@@ -42,7 +52,7 @@ Apply the 100 percent requirement literally. Even a tiny nonzero AI or suspected
 - If the user provides a brief instead of a draft, inventory the supplied source material and approved facts before writing. Ask only for facts whose absence would make the requested article unsafe or misleading; otherwise mark gaps as pending.
 - Treat text marked secret, confidential, internal-only, unpublished policy data, or containing personal identifiers as sensitive. Do not send it to Tencent until it is appropriately redacted or the user confirms they are authorized to transmit that specific text.
 - Preserve the original file. Never overwrite it.
-- For TXT or Markdown, read the text directly. For DOCX, use the `documents` skill to extract all relevant body text, tables, headings, footnotes, and tracked content. Exclude only material that is intentionally outside the article.
+- For TXT or Markdown, read the text directly. For DOCX, use the runtime's document tooling (on WorkBuddy, the `tencent-docx` skill; otherwise `python-docx`) to extract all relevant body text, tables, headings, footnotes, and tracked content. Exclude only material that is intentionally outside the article.
 
 ### 2. Create canonical text and a fact ledger
 
